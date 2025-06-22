@@ -13,19 +13,19 @@ typedef struct {
 
 typedef struct {
     Pixel   centroid;       // centroid value
-    Point** points;
+    double rgbCumm[3];
     int     clusterId;
-    int     nPoints;
+    size_t     nPoints;
     size_t _arrSize;
 } Cluster;
 
 int initializeClusters(Cluster** clusters, Point** points, Point** chosenCentroids, int numClusters, int numPoints);
 int calculateNewMean(Cluster* cluster);
-int clusterAddPoint(Cluster* cluster, Point* point);
+int clusterAddPoint(Cluster* cluster, const Point* point);
 void clusterResetPoints(Cluster* cluster);
-void firstStep(Cluster** clusters, Point** points, Point** chosenCentroids, int numClusters, int numPoints);
-void refineClusters(Cluster** clusters, Point** points, int numClusters, int numPoints);
+void firstStep(Cluster** clusters, Point** points, Point** chosenCentroids, int numClusters, int numPoints, int nThreads);
+void refineClusters(Cluster** clusters, Point** points, int numClusters, int numPoints, int nThreads);
 
-Pixel* generatePalette(Point** points, int numPoints, int numClusters);
+Pixel* generatePalette(Point** points, int numPoints, int numClusters, int numThreads);
 
 #endif //KMEANS_H
