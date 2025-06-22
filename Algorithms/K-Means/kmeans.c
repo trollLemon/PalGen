@@ -1,44 +1,62 @@
 #include "kmeans.h"
+
+#include <float.h>
 #include <math.h>
-#include <stdio.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <time.h>
 
-#include <string.h>
-
 #include "defaults.h"
 
-/*
-  cosineDistance
 
-  Computes the cosine distance between two pixels.
+typedef struct {
 
-  The cosine distance of two vectors is defined as:
+  double rgbAccum[3];
+  size_t numPoints;
 
-   1 - Cosine Similarity(Vector A, Vector B), which is:
+} AccumulatedRGBSums;
 
-   1 - (A⋅B) / (||A|| * ||B||)
- */
-double cosineDistance(const Pixel *a, const Pixel *b) {
+typedef struct {
 
-  const double aDotb = (a->r * b->r) + (a->g * b->g) + (a->b * b->b);
-  const double magA = sqrt((a->r * a->r) + (a->g * a->g) + (a->b * a->b));
-  const double magB = sqrt((b->r * b->r) + (b->g * b->g) + (b->b * b->b));
+  AccumulatedRGBSums *rgbSums;
 
-  return 1.0 - (aDotb / (magA * magB));
+
+} ClusterAccumulations;
+
+typedef struct {
+
+  Point **points;
+  Point **chosenCentroids; // for first step
+  Cluster **clusters;
+  ClusterAccumulations clusterAccumulations;
+  size_t startIdx;
+  size_t endIdx;
+  size_t numClusters;
+
+} ThreadPartition;
+
+
+
+
+double squaredEuclidianDistance(const Pixel *a, const Pixel *b) {
+  double dr = a->r - b->r;
+  double dg = a->g - b->g;
+  double db = a->b - b->b;
+  return dr * dr + dg * dg + db * db;
 }
 
 
-
-bool converged(const Pixel *oldCentroids, const Pixel *newCentroids, const int numClusters) {
+bool converged(const Pixel *oldCentroids, const Pixel *newCentroids,
+               const int numClusters) {
 
   bool converged = true;
 
   for (size_t i = 0; i < numClusters; i++) {
-      const Pixel oldCentroid = oldCentroids[i];
-      const Pixel newCentroid = newCentroids[i];
+    const Pixel oldCentroid = oldCentroids[i];
+    const Pixel newCentroid = newCentroids[i];
 
-    if (!(oldCentroid.r == newCentroid.r && oldCentroid.g == newCentroid.g && oldCentroid.b == newCentroid.b)) {
+    if (!(oldCentroid.r == newCentroid.r && oldCentroid.g == newCentroid.g &&
+          oldCentroid.b == newCentroid.b)) {
       converged = false;
       break;
     }
@@ -48,7 +66,7 @@ bool converged(const Pixel *oldCentroids, const Pixel *newCentroids, const int n
 }
 
 bool isChosen(const Point *point, Point **chosenCentroids,
-              const int numClusters) {
+              const size_t numClusters) {
 
   for (size_t i = 0; i < numClusters; i++) {
     const Point *centroid = chosenCentroids[i];
@@ -58,6 +76,75 @@ bool isChosen(const Point *point, Point **chosenCentroids,
   }
 
   return 0;
+}
+
+void assignClusters(const size_t numClusters,
+                    const ClusterAccumulations *clusterAccumulations,
+                    Cluster **clusters, const Point *point) {
+  double bestDistance = DBL_MAX;
+  size_t bestIdx = 0;
+
+  for (size_t j = 0; j < numClusters; j++) {
+    const Cluster *cluster = clusters[j];
+    const double distance = squaredEuclidianDistance(&point->pixel, &cluster->centroid);
+
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestIdx = j;
+    }
+  }
+
+  AccumulatedRGBSums *selectedSums = clusterAccumulations->rgbSums;
+  selectedSums[bestIdx].rgbAccum[0] += (double)clusters[bestIdx]->centroid.r;
+  selectedSums[bestIdx].rgbAccum[1] += (double)clusters[bestIdx]->centroid.g;
+  selectedSums[bestIdx].rgbAccum[2] += (double)clusters[bestIdx]->centroid.b;
+  selectedSums[bestIdx].numPoints += 1;
+}
+
+void *threadedFirstStep(void *args) {
+
+  const ThreadPartition *partition = args;
+
+  const ClusterAccumulations clusterAccumulations =
+      partition->clusterAccumulations;
+
+  Point **points = partition->points;
+  Point **chosenCentroids = partition->chosenCentroids;
+  Cluster **clusters = partition->clusters;
+
+  const size_t startIdx = partition->startIdx;
+  const size_t endIdx = partition->endIdx;
+  const size_t numClusters = partition->numClusters;
+
+  for (size_t i = startIdx; i < endIdx; i++) {
+    Point *currPoint = points[i];
+    if (isChosen(currPoint, chosenCentroids, numClusters)) {
+      continue;
+    }
+    assignClusters(numClusters, &clusterAccumulations, clusters, currPoint);
+  }
+  return nullptr;
+}
+
+void *threadedRefine( void *args) {
+
+  const ThreadPartition *partition = args;
+
+  const ClusterAccumulations clusterAccumulations =
+      partition->clusterAccumulations;
+
+  Point **points = partition->points;
+  Cluster **clusters = partition->clusters;
+
+  const size_t startIdx = partition->startIdx;
+  const size_t endIdx = partition->endIdx;
+  const size_t numClusters = partition->numClusters;
+
+  for (size_t i = startIdx; i < endIdx; i++) {
+    Point *currPoint = points[i];
+    assignClusters(numClusters, &clusterAccumulations, clusters, currPoint);
+  }
+  return nullptr;
 }
 
 /*
@@ -70,9 +157,9 @@ int initializeClusters(Cluster **clusters, Point **points,
                        Point **chosenCentroids, const int numClusters,
                        const int numPoints) {
 
-  srand(
-      time(NULL)); // this is a basic seed and not optimal for complex tasks
-                   // like cryptography, but for simple shuffling this is fine.
+  srand(time(nullptr) * numClusters *
+        numPoints); // this is a basic seed and not optimal for complex tasks
+                    // like cryptography, but for simple shuffling this is fine.
 
   // Fish Yates Shuffle
 
@@ -91,10 +178,8 @@ int initializeClusters(Cluster **clusters, Point **points,
 
     Cluster *cluster = malloc(sizeof(Cluster));
 
-    cluster->points = malloc(sizeof(Point *) * STARTING_ARRAY_SIZE);
     cluster->_arrSize = STARTING_ARRAY_SIZE;
-    cluster->nPoints = 0;
-
+    clusterResetPoints(cluster);
     cluster->centroid.r = point->pixel.r;
     cluster->centroid.g = point->pixel.g;
     cluster->centroid.b = point->pixel.b;
@@ -107,46 +192,66 @@ int initializeClusters(Cluster **clusters, Point **points,
 }
 
 void firstStep(Cluster **clusters, Point **points, Point **chosenCentroids,
-               int numClusters, int numPoints) {
+               int numClusters, int numPoints, int nThreads) {
 
-  for (size_t i = 0; i < numPoints; i++) {
+  pthread_t threads[nThreads];
+  ThreadPartition *partitions = malloc(sizeof(ThreadPartition) * nThreads);
 
-    Point *point = points[i];
+  const size_t partitionSize = numPoints / nThreads;
+  size_t startIdx = 0;
+  size_t endIdx = partitionSize;
 
-    // check if this point is marked as a centroid for any cluster.
-    // if it is, we should skip it.
-    // TODO: use a set. This function is O(n) time, ideally this should be O(1).
-    if (isChosen(point, chosenCentroids, numClusters)) {
-      continue;
+  for (size_t i = 0; i < nThreads; i++) {
+    partitions[i].startIdx = startIdx;
+    partitions[i].endIdx = (i == nThreads - 1) ? numPoints : endIdx;
+    partitions[i].numClusters = numClusters;
+    partitions[i].chosenCentroids = chosenCentroids;
+    partitions[i].points = points;
+    partitions[i].clusters = clusters;
+    // partitions[i].clusterAccumulations = {};
+    partitions[i].clusterAccumulations.rgbSums =
+        malloc(sizeof(AccumulatedRGBSums) * numClusters);
+    startIdx = endIdx;
+    endIdx += partitionSize;
+
+    if (pthread_create(&threads[i], nullptr, threadedFirstStep, &partitions[i]) !=
+        0) {
+      // error handle
     }
-
-    size_t bestClusterIndex = 0;
-    double shortestDistance = INFINITY;
-    for (size_t j = 0; j < numClusters; j++) {
-
-      const Pixel *currPixel = &point->pixel;
-      const Pixel *currCentroid = &clusters[j]->centroid;
-      const double distance = cosineDistance(currPixel, currCentroid);
-
-      if (distance < shortestDistance) {
-        bestClusterIndex = j;
-        shortestDistance = distance;
-      }
-    }
-
-    Cluster *closestCluster = clusters[bestClusterIndex];
-    int result = clusterAddPoint(closestCluster, point);
+  }
+  for (size_t i = 0; i < nThreads; i++) {
+    pthread_join(threads[i], nullptr);
   }
 
   // update centroids
-  for (size_t i = 0; i < numClusters; i++) {
-    calculateNewMean(clusters[i]);
-    clusterResetPoints(clusters[i]);
+  for (size_t j = 0; j < numClusters; j++) {
+    for (size_t i = 0; i < nThreads; i++) {
+
+      AccumulatedRGBSums *accumulations =
+          partitions[i].clusterAccumulations.rgbSums;
+
+      size_t nPoints = accumulations[j].numPoints;
+      double *rgbSums = accumulations[j].rgbAccum;
+      clusters[j]->nPoints += nPoints;
+      for (size_t chan = 0; chan < 3; chan++) {
+        clusters[j]->rgbCumm[chan] += rgbSums[chan];
+      }
+
+
+    }
+    calculateNewMean(clusters[j]);
+    clusterResetPoints(clusters[j]);
   }
+
+  for (size_t i = 0; i < nThreads; i++) {
+    free(partitions[i].clusterAccumulations.rgbSums);
+  }
+  free(partitions);
 }
 
+
 void refineClusters(Cluster **clusters, Point **points, const int numClusters,
-                    const int numPoints) {
+                    const int numPoints,  int nThreads) {
 
   Pixel *oldCentroids = malloc(sizeof(Pixel) * numClusters);
   Pixel *newCentroids = malloc(sizeof(Pixel) * numClusters);
@@ -158,144 +263,128 @@ void refineClusters(Cluster **clusters, Point **points, const int numClusters,
     return;
   }
 
+  pthread_t threads[nThreads];
+  ThreadPartition *partitions = malloc(sizeof(ThreadPartition) * nThreads);
+
+  const size_t partitionSize = numPoints / nThreads;
+  size_t startIdx = 0;
+  size_t endIdx = partitionSize;
   bool shouldIterate = 1;
   while (shouldIterate) {
-
-
     for (size_t i = 0; i < numClusters; i++) {
       oldCentroids[i] = points[i]->pixel;
     }
 
-    for (size_t i = 0; i < numPoints; i++) {
+    for (size_t i = 0; i < nThreads; i++) {
+      partitions[i].startIdx = startIdx;
+      partitions[i].endIdx = (i == nThreads - 1) ? numPoints : endIdx;
+      partitions[i].numClusters = numClusters;
+      partitions[i].points = points;
+      partitions[i].clusters = clusters;
+      // partitions[i].clusterAccumulations = {};
+      partitions[i].clusterAccumulations.rgbSums =
+          malloc(sizeof(AccumulatedRGBSums) * numClusters);
+      startIdx = endIdx;
+      endIdx += partitionSize;
 
-      Point *point = points[i];
-
-      size_t bestClusterIndex = 0;
-      double shortestDistance = INFINITY;
-      for (size_t j = 0; j < numClusters; j++) {
-
-        const Pixel *currPixel = &point->pixel;
-        const Pixel *currCentroid = &clusters[j]->centroid;
-        const double distance = cosineDistance(currPixel, currCentroid);
-
-        if (distance < shortestDistance) {
-          bestClusterIndex = j;
-          shortestDistance = distance;
-        }
+      if (pthread_create(&threads[i], nullptr, threadedRefine, &partitions[i]) !=
+          0) {
+        // error handle
       }
-
-      Cluster *closestCluster = clusters[bestClusterIndex];
-      int result = clusterAddPoint(closestCluster, point);
+    }
+    for (size_t i = 0; i < nThreads; i++) {
+      pthread_join(threads[i], nullptr);
     }
 
     // update centroids
-    for (size_t i = 0; i < numClusters; i++) {
-      calculateNewMean(clusters[i]);
-      clusterResetPoints(clusters[i]);
+    for (size_t j = 0; j < numClusters; j++) {
+      for (size_t i = 0; i < nThreads; i++) {
+
+        const AccumulatedRGBSums *accumulations =
+            partitions[i].clusterAccumulations.rgbSums;
+
+        const size_t nPoints = accumulations[j].numPoints;
+        const double *rgbSums = accumulations[j].rgbAccum;
+        clusters[j]->nPoints += nPoints;
+        for (size_t chan = 0; chan < 3; chan++) {
+          clusters[j]->rgbCumm[chan] += rgbSums[chan];
+        }
+
+
+      }
+      calculateNewMean(clusters[j]);
+      clusterResetPoints(clusters[j]);
     }
+
 
     for (size_t i = 0; i < numClusters; i++) {
       newCentroids[i] = points[i]->pixel;
     }
 
     shouldIterate = !converged(oldCentroids, newCentroids, numClusters);
-
-
   }
 
+  for (size_t i = 0; i < nThreads; i++) {
+    free(partitions[i].clusterAccumulations.rgbSums);
+  }
   free(oldCentroids);
   free(newCentroids);
-
+  free(partitions);
 }
 
-
 void clusterResetPoints(Cluster *cluster) {
-  //lazily reset point counter. We will overwrite the old pointer values in the array next iteration
+  cluster->rgbCumm[0] = 0;
+  cluster->rgbCumm[1] = 0;
+  cluster->rgbCumm[2] = 0;
   cluster->nPoints = 0;
 }
 
-int clusterAddPoint(Cluster *cluster, Point *point) {
+int clusterAddPoint(Cluster *cluster, const Point *point) {
 
-  // double array size if full
-  // TODO: grow this exponentially?
-  if (cluster->nPoints == cluster->_arrSize) {
-    const size_t newSize = cluster->_arrSize * 2;
-
-    Point **newArray = malloc(sizeof(Point *) * newSize);
-
-    if (newArray == NULL) {
-      return 0;
-    }
-
-    memcpy(newArray, cluster->points, sizeof(Point *) * cluster->_arrSize);
-    free(cluster->points);
-    cluster->_arrSize = newSize;
-    cluster->points = newArray;
-  }
-
-  cluster->points[cluster->nPoints] = point;
+  cluster->rgbCumm[0] += point->pixel.r;
+  cluster->rgbCumm[1] += point->pixel.g;
+  cluster->rgbCumm[2] += point->pixel.b;
   cluster->nPoints++;
-
   return 1;
 }
 
 int calculateNewMean(Cluster *cluster) {
 
-  if (cluster == NULL)
+  if (cluster == nullptr)
     return -1;
 
-  Point **points = cluster->points;
+  const double meanR = cluster->rgbCumm[0] / (double)cluster->nPoints;
+  const double meanG = cluster->rgbCumm[1] / (double)cluster->nPoints;
+  const double meanB = cluster->rgbCumm[2] / (double)cluster->nPoints;
 
-  Pixel *centroid = &cluster->centroid;
-
-  const int nPoints = cluster->nPoints;
-
-  double sumR = 0;
-  double sumG = 0;
-  double sumB = 0;
-
-  for (size_t i = 0; i < nPoints; i++) {
-    const Point *point = points[i];
-    sumR += point->pixel.r;
-    sumG += point->pixel.g;
-    sumB += point->pixel.b;
-  }
-
-  const double meanR = sumR / nPoints;
-  const double meanG = sumG / nPoints;
-  const double meanB = sumB / nPoints;
-
-  centroid->r = (unsigned char)round(meanR);
-  centroid->g = (unsigned char)round(meanG);
-  centroid->b = (unsigned char)round(meanB);
+  cluster->centroid.r = (unsigned char)round(meanR);
+  cluster->centroid.g = (unsigned char)round(meanG);
+  cluster->centroid.b = (unsigned char)round(meanB);
 
   return 0;
 }
 
+Pixel *generatePalette(Point **points, const int numPoints,
+                       const int numClusters, const int numThreads) {
 
-
-Pixel* generatePalette(Point** points, const int numPoints, const int numClusters) {
-
-  Pixel* palette = malloc(sizeof(Pixel) * numClusters);
-  Cluster** clusters = malloc(sizeof(Cluster*) * numClusters);
-  Point** chosenCentroids = malloc(sizeof(Point*) * numClusters);
+  Pixel *palette = malloc(sizeof(Pixel) * numClusters);
+  Cluster **clusters = malloc(sizeof(Cluster *) * numClusters);
+  Point **chosenCentroids = malloc(sizeof(Point *) * numClusters);
   if (!palette || !clusters || !chosenCentroids) {
-    return NULL;
+    return nullptr;
   }
 
-  initializeClusters(clusters,points,chosenCentroids,numClusters,numPoints);
-  firstStep(clusters,points,chosenCentroids,numClusters,numPoints);
+  initializeClusters(clusters, points, chosenCentroids, numClusters, numPoints);
+  firstStep(clusters, points, chosenCentroids, numClusters, numPoints, numThreads);
   free(chosenCentroids);
 
-  refineClusters(clusters,points,numClusters,numPoints);
+  refineClusters(clusters, points, numClusters, numPoints,numThreads);
 
   for (size_t i = 0; i < numClusters; i++) {
     palette[i] = clusters[i]->centroid;
-    free(clusters[i]->points);
     free(clusters[i]);
   }
   free(clusters);
 
   return palette;
-
 }
