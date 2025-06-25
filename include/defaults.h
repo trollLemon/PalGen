@@ -6,5 +6,4 @@
 #define DEFAULTS_H
 
 constexpr int DEFAULT_PALETTE_SIZE = 8;
-constexpr int STARTING_ARRAY_SIZE = 100;
-#endif //DEFAULTS_H
+#endif // DEFAULTS_H
